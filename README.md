@@ -1,37 +1,30 @@
-# SaaS / App Development Pre-Coding Checklist
+# Full Pre-Coding Checklist for SaaS / Apps
 
-## Step 1: Requirements Gathering (The "Spec" Phase)
+## Step 1: Requirements Gathering
+**Functional Requirements**  
+What must the system do? List the core capabilities clearly.
 
-Before drawing a single architecture diagram, write down two things:
+*Example:* Accept JSON via API → inject into a `.docx` template → convert to PDF → return a secure download link via webhook.
 
-### Functional Requirements
-What must the system do?
+**Non-Functional Requirements (NFRs)**  
+- **Latency**: Queuing a job must respond in < 200 ms.  
+- **Reliability**: 99.9% uptime. Jobs must survive server crashes.  
+- **Security**: Strict tenant isolation.  
+- **Scalability**: Handle X concurrent jobs / Y requests per second.  
+- **Cost**: Stay within expected infrastructure budget at target scale.  
+- **Compliance**: Any legal/regulatory needs (GDPR, data residency, etc.).
 
-*Example:* Accept JSON via API, inject into a `.docx` template, convert to PDF, and return a secure link via webhook.
+## Step 2: API-First Design & Contracts
+Define the external contract before writing implementation code (OpenAPI or equivalent).
 
-### Non-Functional Requirements (NFRs)
-How well must it perform?
+- Endpoint shapes, methods, and paths  
+- Request and response schemas  
+- Error format (consistent across the API)  
+- Status codes  
+- Versioning strategy  
+- Pagination / filtering (if applicable)
 
-- **Latency**: API response for queuing a job must be under 200 milliseconds.
-- **Reliability**: 99.9% uptime; if a server crashes mid-render, the job must not vanish.
-- **Security**: Tenant isolation (Client A must never be able to download or view Client B’s private templates).
-
----
-
-## Step 2: Designing the Data Flow & Contract (API-First Design)
-
-Never build the frontend or backend first. Write the API Contract using OpenAPI/Swagger specs so there is zero ambiguity about request and response shapes.
-
-**Endpoint:** `POST /v1/templates/{id}/render`
-
-**Headers:**
-- `Authorization: Bearer <token>`
-- `Idempotency-Key: <uuid>`
-
-**Body:** JSON payload containing variable data.
-
-**Response (Immediate Async Acknowledgement):**
-
+*Example response for async job:*
 ```json
 {
   "status": "queued",
@@ -40,46 +33,88 @@ Never build the frontend or backend first. Write the API Contract using OpenAPI/
 }
 ```
 
+## Step 3: Data Modeling
+Design core entities, relationships, and ownership early.
+
+- Main tables/collections and their fields  
+- Relationships and constraints  
+- Multi-tenancy approach (tenant_id on every record + enforced queries)  
+- What is stored vs derived  
+- Soft deletes vs hard deletes  
+- Indexing needs for common queries
+
+*Example:* Every template and every generated document belongs to a `tenant_id`. Unique constraints prevent name collisions within a tenant.
+
+## Step 4: Architectural Pattern
+Choose based on workload characteristics.
+
+- Synchronous vs asynchronous boundaries  
+- Communication style (REST, queue, webhooks, events)  
+- Service / module boundaries  
+
+*Example (Producer-Consumer):*  
+- **Producer (API)**: Validate → save “pending” state → push job ID to queue → return immediately.  
+- **Consumer (Workers)**: Pull jobs, perform heavy work (e.g. LibreOffice conversion), update status, send webhook.
+
+## Step 5: Failure Modes & Reliability
+Plan for real-world problems.
+
+- Retry strategy and limits  
+- Idempotency (duplicate request handling)  
+- Partial failures and compensating actions  
+- Dead-letter / failed job handling  
+- What happens when dependencies are down  
+
+*Example:* Require `Idempotency-Key`. Store key + result in Redis. Retry rendering up to 3 times with backoff. Permanently failed jobs go to a dead-letter queue and still trigger a failure webhook.
+
+## Step 6: Security & Abuse Prevention
+- Authentication and authorization model  
+- Tenant isolation (enforced at every layer)  
+- Input validation and schema enforcement  
+- File size / type limits  
+- Rate limiting and quotas  
+- Secrets management  
+- Protection against common attacks (zip bombs, oversized payloads, etc.)
+
+*Example:* Max upload 5 MB. Unpack with stream limits. All queries automatically scoped by `tenant_id` from the authenticated token. Never trust client-supplied tenant identifiers.
+
+## Step 7: Observability
+You must be able to understand system behavior in production.
+
+- Structured logging (include correlation IDs such as `job_id`, `tenant_id`)  
+- Key metrics (queued, processing, completed, failed, latency)  
+- Distributed tracing for async flows  
+- Alerting thresholds  
+
+*Example:* Every log line carries `job_id`. Dashboard shows jobs_completed vs jobs_failed. Trace covers API → queue → worker → webhook.
+
+## Step 8: Testing Strategy
+Decide what to test and at which level before building.
+
+- Unit tests for business logic and validation  
+- Integration tests for API + database + queue  
+- End-to-end tests for critical async flows  
+- Contract tests (if multiple consumers)  
+- Load / performance tests for bottlenecks  
+
+## Step 9: Infrastructure, Deployment & Operations
+- Containerization (consistent environments)  
+- CI/CD pipeline  
+- Environment parity (dev ≈ staging ≈ prod)  
+- Backup and restore strategy  
+- Ephemeral storage cleanup  
+- Stateless workers / easy horizontal scaling  
+- Secret and config management  
+
+*Example:* Everything runs in Docker. Temporary render files are deleted after success or failure. Workers are stateless and can be restarted or scaled without data loss.
+
+## Step 10: Rollout & Evolution Considerations
+- Feature flags or gradual rollout plan  
+- Backward compatibility expectations  
+- Migration strategy for schema or contract changes  
+- Monitoring plan for the first weeks after launch  
+
 ---
 
-## Step 3: Choosing the Right Architectural Pattern (Decoupled & Asynchronous)
-
-**Why asynchronous?** File conversion (especially LibreOffice converting Word docs to PDFs) is CPU-bound and slow.
-
-If a client sends 50 requests at once and the server tries to process them synchronously in a single HTTP thread, the server will block, run out of memory, and throw a `504 Gateway Timeout`.
-
-### Producer-Consumer Pattern (Message Queue)
-
-- **The Producer (FastAPI):**  
-  Receives the request, validates the JSON data against the schema in microseconds, saves the state as “Pending” in PostgreSQL, pushes the job ID to a Redis queue, and immediately tells the client: “Got it, I’m working on it.”
-
-- **The Consumer (Celery / BullMQ Workers):**  
-  Background worker processes pull jobs off the queue one by one at their own stable pace, execute the heavy file rendering safely away from the web server, and send a webhook back when finished.
-
----
-
-## Step 4: Defense-in-Depth (Security & Edge Case Planning)
-
-Anticipate how users (or malicious actors) will try to break the system:
-
-- **The “Zip Bomb” Threat**  
-  A malicious user could upload a 2KB `.docx` file that expands into a 10GB file when unzipped, instantly crashing the server memory.  
-  **Pro fix:** Enforce strict file size limits on upload (e.g., max 5MB) and unpack with secure stream limits.
-
-- **Idempotency (Duplicate Prevention)**  
-  If an automation tool like n8n glitches and sends the exact same invoice generation request twice due to a network timeout, the system uses an `Idempotency-Key` stored in Redis to catch the duplicate and return the cached result instead of billing the user twice or generating duplicate files.
-
-- **Ephemeral Storage Cleanup**  
-  Rendering documents creates temporary files (`/tmp/output.docx`). Ensure a cron job or cleanup script purges local temporary server storage every hour so the disk doesn’t fill up and crash the container.
-
----
-
-## Step 5: Infrastructure as Code & Deployment Strategy
-
-Instead of manually clicking around an AWS dashboard, define infrastructure using Docker and automated deployment scripts:
-
-- **Dockerized Micro-Environment**  
-  Everything—FastAPI, Redis, Postgres, and the LibreOffice headless rendering engine—is packed into isolated Docker containers. This ensures the code runs identically on the developer’s laptop as it does on a cloud server.
-
-- **Stateless Workers**  
-  The worker nodes that render the documents contain zero user data. If a worker container crashes or gets overloaded, Kubernetes or a simple process manager instantly spins up a fresh, clean container to take its place.
+**Usage tip**  
+Focus deepest effort on Steps 1–6. These decisions are usually the most expensive to reverse. The rest can be refined as you build, provided the foundations above are solid.
